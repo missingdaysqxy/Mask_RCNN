@@ -13,7 +13,7 @@ import skimage.io
 import matplotlib.pyplot as plt
 
 #自定义本次测试使用的模型名称
-MODEL_NAME = "mask_rcnn-gxl.h5"
+MODEL_NAME = "mask_rcnn-102.h5"
 
 #根目录
 ROOT_DIR = os.path.abspath(".")
