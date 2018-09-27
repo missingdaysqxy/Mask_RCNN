@@ -22,24 +22,11 @@ from mrcnn import visualize
 from mrcnn.model import log
 print('工作目录为：%s' % ROOT_DIR)
 # 路径设置
-
-def get_dataset_list(dataset_folder):
-    list = os.listdir(dataset_folder)  # 该文件夹下所有的文件与子文件夹名称
-    imglist=[]
-    for name in list:
-        if name.endswith('_json'):
-            if os.path.exists(os.path.join(dataset_folder, name + '/label.png')) and\
-               os.path.exists(os.path.join(dataset_folder, name + '/img.png')) and\
-               os.path.exists(os.path.join(dataset_folder, name + '/info.yaml')):
-                   imglist.append(name)
-    return imglist
-
-#rgb_folder = os.path.join(dataset_root_path, "rgb")     #存放原始彩色图像
-#mask_folder = os.path.join(dataset_root_path, "mask")   #存放由image_16_8.py生成的数据图像
-#yaml_folder = os.path.join(dataset_root_path, "json")   #存放由labelme_json_to_dataset.exe生成的文件夹
-dataset_folder = os.path.join(ROOT_DIR, "dataset")   #训练数据目录
-imglist = get_dataset_list(dataset_folder)
-print(imglist)
+dataset_root_path = os.path.join(ROOT_DIR, "dataset")   #训练数据目录
+rgb_folder = os.path.join(dataset_root_path, "rgb")     #存放原始彩色图像
+mask_folder = os.path.join(dataset_root_path, "mask")   #存放由image_16_8.py生成的数据图像
+yaml_folder = os.path.join(dataset_root_path, "json")   #存放由labelme_json_to_dataset.exe生成的文件夹
+imglist = os.listdir(mask_folder)
 # Directory to save logs and trained model
 MODEL_DIR = os.path.join(ROOT_DIR, "logs")
 # Local path to trained weights file
@@ -85,7 +72,7 @@ class RoomDataset(utils.Dataset):
                 
     #重新写load_shapes，里面包含自己的类别class_list，
     #并在self.image_info信息中添加了path、mask_path、yaml_path
-    def load_shapes(self, dataset_folder, imglist):
+    def load_shapes(self, rgb_folder, mask_folder, imglist):
         """Generate the requested number of synthetic images.
         count: number of images to generate.
         """
@@ -97,13 +84,13 @@ class RoomDataset(utils.Dataset):
         for i in range(count):
             print('loading shapes of file %s' % imglist[i])
             filename = imglist[i].split(".")[0]
-            rgb_path = os.path.join(dataset_folder, filename + "/img.png")            
+            rgb_path = os.path.join(rgb_folder, filename + ".png")            
             if not os.path.exists(rgb_path):
                 raise IOError('%s not exist!' % rgb_path)
-            mask_path = os.path.join(dataset_folder, filename + "/label.png")
+            mask_path = os.path.join(mask_folder, filename + ".png")
             if not os.path.exists(mask_path):
                 raise IOError('%s not exist!' % mask_path)
-            yaml_path = os.path.join(dataset_folder, filename + "/info.yaml")
+            yaml_path = os.path.join(yaml_folder, filename + "/info.yaml")
             if not os.path.exists(yaml_path):
                 raise IOError('%s not exist!' % yaml_path)
             img = Image.open(rgb_path)
@@ -205,11 +192,11 @@ config.display()
 # In[5]:
 #train与val数据集准备
 dataset_train = RoomDataset()
-dataset_train.load_shapes(dataset_folder, imglist)
+dataset_train.load_shapes(rgb_folder, mask_folder, imglist)
 dataset_train.prepare()
 
 dataset_val = RoomDataset()
-dataset_val.load_shapes(dataset_folder, imglist)
+dataset_val.load_shapes(rgb_folder, mask_folder, imglist)
 dataset_val.prepare()
 
 # In[6]:

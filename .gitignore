@@ -56,34 +56,3 @@ pip-delete-this-directory.txt
 .venv
 venv/
 ENV/
-/dataset/4-102-03 (3)_json
-/dataset/4-102-03 (2)_json
-/dataset/4-102-02_json
-/dataset/4-102-02 (5)_json
-/dataset/4-102-02 (4)_json
-/dataset/4-102-02 (3)_json
-/dataset/4-102-02 (2)_json
-/dataset/4-102-01_json
-/dataset/4-102-01 (5)_json
-/dataset/4-102-01 (4)_json
-/dataset/4-102-01 (3)_json
-/dataset/4-102-01 (2)_json
-/dataset/4-102-03_json/label_viz.png
-/dataset/4-102-03_json/label_names.txt
-/dataset/4-102-03_json/label.png
-/dataset/4-102-03_json/info.yaml
-/dataset/4-102-03_json/img.png
-/dataset/4-102-03_json
-/dataset/4-102-03 (5)_json/label_viz.png
-/dataset/4-102-03 (5)_json/label_names.txt
-/dataset/4-102-03 (5)_json/label.png
-/dataset/4-102-03 (5)_json/info.yaml
-/dataset/4-102-03 (5)_json/img.png
-/dataset/4-102-03 (5)_json
-/dataset/4-102-03 (4)_json/label_viz.png
-/dataset/4-102-03 (4)_json/label_names.txt
-/dataset/4-102-03 (4)_json/label.png
-/dataset/4-102-03 (4)_json/info.yaml
-/dataset/4-102-03 (4)_json/img.png
-/dataset/4-102-03 (4)_json
-/test_img/img.png
