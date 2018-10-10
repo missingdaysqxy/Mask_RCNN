@@ -99,6 +99,114 @@ Person_ID = 1
 ############################################################
 #  Dataset
 ############################################################
+class RoomDataset(utils.Dataset):
+    # 类别列表
+    class_names = {"person"}
+
+    # class_names = {"person","laptop","pen","bottle"}
+    # 从类外获取类别数量
+    @classmethod
+    def get_class_count(cls):
+        return len(RoomDataset.class_names)
+
+    # 保存已计算的遮罩数组与标签数组
+    __masks = {}
+
+    def __init__(self):
+        super(RoomDataset, self).__init__()
+
+    # 得到该图中有多少个实例（物体）
+    def get_obj_index(self, maskimage):
+        n = np.max(maskimage)
+        return n
+
+    # 解析labelme中得到的yaml文件，从而得到mask每一层对应的实例标签
+    def from_yaml_get_class(self, image_id):
+        info = self.image_info[image_id]
+        print(info['yaml_path'])
+        with open(info['yaml_path']) as f:
+            temp = yaml.load(f.read())
+            labels = temp['label_names']
+            del labels[0]
+        return labels
+
+    # 重新写load_shapes，里面包含自己的类别class_list，
+    # 并在self.image_info信息中添加了path、mask_path、yaml_path
+    def load_shapes(self, dataset_folder, imglist):
+        """Generate the requested number of synthetic images.
+        count: number of images to generate.
+        """
+        print('begin loading shapes...')
+        # Add classes
+        for i, class_name in enumerate(self.class_names):
+            self.add_class("shapes", i + 1, class_name)
+        count = len(imglist)
+        for i in range(count):
+            print('loading shapes of file %s' % imglist[i])
+            filename = imglist[i].split(".")[0]
+            rgb_path = os.path.join(dataset_folder, filename + "/img.png")
+            if not os.path.exists(rgb_path):
+                raise IOError('%s not exist!' % rgb_path)
+            mask_path = os.path.join(dataset_folder, filename + "/label.png")
+            if not os.path.exists(mask_path):
+                raise IOError('%s not exist!' % mask_path)
+            yaml_path = os.path.join(dataset_folder, filename + "/info.yaml")
+            if not os.path.exists(yaml_path):
+                raise IOError('%s not exist!' % yaml_path)
+            img = Image.open(rgb_path)
+            self.add_image("shapes", image_id=i, path=rgb_path,
+                           width=img.width, height=img.height,
+                           mask_path=mask_path, yaml_path=yaml_path)
+            img.close()
+
+    # 重写load_mask
+    def load_mask(self, image_id):
+        """Generate instance masks for shapes of the given image ID.
+        """
+
+        # 根据灰度遮罩图生成mask数组
+        def draw_mask(num_obj, mask, maskimage):
+            info = self.image_info[image_id]
+            # print('%d objects in %d * %d image.' % (num_obj,info['width'],info['height']))
+            for i in range(info['width']):
+                for j in range(info['height']):
+                    at_pixel = maskimage.getpixel((i, j))  # 检索指定坐标点的像素的灰度值
+                    if at_pixel > 0:
+                        mask[j, i, at_pixel - 1] = 1
+            return mask
+
+        if not image_id in self.__masks:
+            print('begin loading masks with image ID: %d' % image_id)
+            global iter_num
+            info = self.image_info[image_id]
+            count = 1  # number of object
+            maskimg = Image.open(info['mask_path'])
+            num_obj = self.get_obj_index(maskimg)
+            mask = np.zeros([info['height'], info['width'], num_obj], dtype=np.uint8)
+            mask = draw_mask(num_obj, mask, maskimg)
+            maskimg.close()  # 记得关闭文件
+            occlusion = np.logical_not(mask[:, :, -1]).astype(np.uint8)
+            for i in range(count - 2, -1, -1):
+                mask[:, :, i] = mask[:, :, i] * occlusion
+                occlusion = np.logical_and(occlusion, np.logical_not(mask[:, :, i]))
+            labels = []
+            labels = self.from_yaml_get_class(image_id)
+            labels_form = []
+            class_counts = {}
+            for i in range(len(labels)):
+                for class_name in self.class_names:
+                    if labels[i].find(class_name) != -1:
+                        if class_name in class_counts:
+                            class_counts[class_name] += 1
+                        else:
+                            class_counts[class_name] = 1
+                        labels_form.append(class_name)
+            print('classes: %s' % class_counts)
+            class_ids = np.array([self.class_names.index(s) for s in labels_form])
+            # 将新数组保存
+            self.__masks[image_id] = [mask.astype(np.bool), class_ids.astype(np.int32)]
+        return self.__masks[image_id]
+
 
 class CocoDataset(utils.Dataset):
     def __init__(self, task_type= "instances",class_map = None):
