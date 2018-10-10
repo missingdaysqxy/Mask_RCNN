@@ -1,37 +1,16 @@
-"""
-Mask R-CNN
-Configurations and data loading code for MS COCO.
+# -*- coding: utf-8 -*-
+# @Time    : 2018/9/29 13:57
+# @Author  : qxliu
+# @Email   : qixuan.lqx@qq.com
+# @File    : train_keypoints.py
+# @Software: PyCharm
 
-Copyright (c) 2017 Matterport, Inc.
-Licensed under the MIT License (see LICENSE for details)
-Written by Waleed Abdulla
-
-------------------------------------------------------------
-
-Usage: import the module (see Jupyter notebooks for examples), or run from
-       the command line as such:
-
-    # Train a new model starting from pre-trained COCO weights
-    python3 train_keypoint.py train --dataset=/path/to/coco/ --model=coco
-
-    # Train a new model starting from ImageNet weights. Also auto download COCO dataset
-    python3 train_keypoint.py train --dataset=/path/to/coco/ --model=imagenet --download=True
-
-    # Continue training a model that you had trained earlier
-    python3 train_keypoint.py train --dataset=/path/to/coco/ --model=/path/to/weights.h5
-
-    # Continue training the last model you trained
-    python3 train_keypoint.py train --dataset=/path/to/coco/ --model=last
-
-    # Run COCO evaluatoin on the last model you trained
-    python3 train_keypoint.py evaluate --dataset=/path/to/coco/ --model=last
-"""
 
 import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 import sys
 import time
 import numpy as np
-import imgaug  # https://github.com/aleju/imgaug (pip3 install imgaug)
 
 # Download and install the Python COCO tools from https://github.com/waleedka/coco
 # That's a fork from the original https://github.com/pdollar/coco with a bug
@@ -47,13 +26,20 @@ import zipfile
 import urllib.request
 import shutil
 
-# Root directory of the project
-ROOT_DIR = os.path.abspath("../../")
-
+#根目录
+ROOT_DIR = os.path.abspath(".")
 # Import Mask RCNN
 sys.path.append(ROOT_DIR)  # To find local version of the library
 from mrcnn.config import Config
-from mrcnn import model as modellib, utils
+from mrcnn import utils
+import mrcnn.model as modellib
+from mrcnn import visualize
+from mrcnn.model import log
+print('工作目录为：%s' % ROOT_DIR)
+
+
+# Root directory of the project
+ROOT_DIR = os.getcwd()
 
 # Path to trained weights file
 COCO_MODEL_PATH = os.path.join(ROOT_DIR, "mask_rcnn_coco.h5")
@@ -61,7 +47,7 @@ COCO_MODEL_PATH = os.path.join(ROOT_DIR, "mask_rcnn_coco.h5")
 # Directory to save logs and model checkpoints, if not provided
 # through the command line argument --logs
 DEFAULT_LOGS_DIR = os.path.join(ROOT_DIR, "logs")
-DEFAULT_DATASET_YEAR = "2014"
+DEFAULT_DATASET_YEAR = "2017"
 
 ############################################################
 #  Configurations
@@ -84,7 +70,30 @@ class CocoConfig(Config):
     # GPU_COUNT = 8
 
     # Number of classes (including background)
-    NUM_CLASSES = 1 + 80  # COCO has 80 classes
+    # NUM_CLASSES = 1 + 80  # COCO has 80 classes
+    NUM_CLASSES = 1 + 1  # Person and background
+
+    NUM_KEYPOINTS = 17
+    MASK_SHAPE = [28, 28]
+    KEYPOINT_MASK_SHAPE = [56,56]
+    # DETECTION_MAX_INSTANCES = 50
+    TRAIN_ROIS_PER_IMAGE = 100
+    MAX_GT_INSTANCES = 128
+    RPN_TRAIN_ANCHORS_PER_IMAGE = 150
+    USE_MINI_MASK = True
+    MASK_POOL_SIZE = 14
+    KEYPOINT_MASK_POOL_SIZE = 7
+    LEARNING_RATE = 0.002
+    STEPS_PER_EPOCH = 1000
+    WEIGHT_LOSS = True
+    KEYPOINT_THRESHOLD = 0.005
+
+    PART_STR = ["nose","left_eye","right_eye","left_ear","right_ear","left_shoulder",
+                "right_shoulder","left_elbow","right_elbow","left_wrist","right_wrist",
+                "left_hip","right_hip","left_knee","right_knee","left_ankle","right_ankle"]
+    LIMBS = [0,-1,-1,5,-1,6,5,7,6,8,7,9,8,10,11,13,12,14,13,15,14,16]
+
+Person_ID = 1
 
 
 ############################################################
@@ -92,6 +101,17 @@ class CocoConfig(Config):
 ############################################################
 
 class CocoDataset(utils.Dataset):
+    def __init__(self, task_type= "instances",class_map = None):
+        assert task_type in ["instances", "person_keypoints"]
+        self.task_type = task_type
+        # the connection between 2 close keypoints
+        self._skeleton = []
+        # keypoint names
+        # ["nose","left_eye","right_eye","left_ear","right_ear","left_shoulder",
+        # "right_shoulder","left_elbow","right_elbow","left_wrist","right_wrist",
+        # "left_hip","right_hip","left_knee","right_knee","left_ankle","right_ankle"]
+        self._keypoint_names = []
+        super().__init__(class_map)
     def load_coco(self, dataset_dir, subset, year=DEFAULT_DATASET_YEAR, class_ids=None,
                   class_map=None, return_coco=False, auto_download=False):
         """Load a subset of the COCO dataset.
@@ -108,7 +128,8 @@ class CocoDataset(utils.Dataset):
         if auto_download is True:
             self.auto_download(dataset_dir, subset, year)
 
-        coco = COCO("{}/annotations/instances_{}{}.json".format(dataset_dir, subset, year))
+
+        coco = COCO("{}/annotations/{}_{}{}.json".format(dataset_dir, self.task_type, subset, year))
         if subset == "minival" or subset == "valminusminival":
             subset = "val"
         image_dir = "{}/{}{}".format(dataset_dir, subset, year)
@@ -117,6 +138,7 @@ class CocoDataset(utils.Dataset):
         if not class_ids:
             # All classes
             class_ids = sorted(coco.getCatIds())
+            # print(class_ids)
 
         # All images or a subset?
         if class_ids:
@@ -142,80 +164,28 @@ class CocoDataset(utils.Dataset):
                 height=coco.imgs[i]["height"],
                 annotations=coco.loadAnns(coco.getAnnIds(
                     imgIds=[i], catIds=class_ids, iscrowd=None)))
-        if return_coco:
-            return coco
 
-    def auto_download(self, dataDir, dataType, dataYear):
-        """Download the COCO dataset/annotations if requested.
-        dataDir: The root directory of the COCO dataset.
-        dataType: What to load (train, val, minival, valminusminival)
-        dataYear: What dataset year to load (2014, 2017) as a string, not an integer
-        Note:
-            For 2014, use "train", "val", "minival", or "valminusminival"
-            For 2017, only "train" and "val" annotations are available
-        """
+        if(self.task_type == "person_keypoints"):
+            #the connection between 2 close keypoints
+            self._skeleton = coco.loadCats(Person_ID)[0]["skeleton"]
+            #keypoint names
+            # ["nose","left_eye","right_eye","left_ear","right_ear","left_shoulder",
+            # "right_shoulder","left_elbow","right_elbow","left_wrist","right_wrist",
+            # "left_hip","right_hip","left_knee","right_knee","left_ankle","right_ankle"]
+            self._keypoint_names = coco.loadCats(Person_ID)[0]["keypoints"]
 
-        # Setup paths and file names
-        if dataType == "minival" or dataType == "valminusminival":
-            imgDir = "{}/{}{}".format(dataDir, "val", dataYear)
-            imgZipFile = "{}/{}{}.zip".format(dataDir, "val", dataYear)
-            imgURL = "http://images.cocodataset.org/zips/{}{}.zip".format("val", dataYear)
-        else:
-            imgDir = "{}/{}{}".format(dataDir, dataType, dataYear)
-            imgZipFile = "{}/{}{}.zip".format(dataDir, dataType, dataYear)
-            imgURL = "http://images.cocodataset.org/zips/{}{}.zip".format(dataType, dataYear)
-        # print("Image paths:"); print(imgDir); print(imgZipFile); print(imgURL)
+            self._skeleton = np.array(self._skeleton,dtype=np.int32)
 
-        # Create main folder if it doesn't exist yet
-        if not os.path.exists(dataDir):
-            os.makedirs(dataDir)
+            print("Skeleton:",np.shape(self._skeleton))
+            print("Keypoint names:",np.shape(self._keypoint_names))
+        if return_coco:           return coco
 
-        # Download images if not available locally
-        if not os.path.exists(imgDir):
-            os.makedirs(imgDir)
-            print("Downloading images to " + imgZipFile + " ...")
-            with urllib.request.urlopen(imgURL) as resp, open(imgZipFile, 'wb') as out:
-                shutil.copyfileobj(resp, out)
-            print("... done downloading.")
-            print("Unzipping " + imgZipFile)
-            with zipfile.ZipFile(imgZipFile, "r") as zip_ref:
-                zip_ref.extractall(dataDir)
-            print("... done unzipping")
-        print("Will use images in " + imgDir)
-
-        # Setup annotations data paths
-        annDir = "{}/annotations".format(dataDir)
-        if dataType == "minival":
-            annZipFile = "{}/instances_minival2014.json.zip".format(dataDir)
-            annFile = "{}/instances_minival2014.json".format(annDir)
-            annURL = "https://dl.dropboxusercontent.com/s/o43o90bna78omob/instances_minival2014.json.zip?dl=0"
-            unZipDir = annDir
-        elif dataType == "valminusminival":
-            annZipFile = "{}/instances_valminusminival2014.json.zip".format(dataDir)
-            annFile = "{}/instances_valminusminival2014.json".format(annDir)
-            annURL = "https://dl.dropboxusercontent.com/s/s3tw5zcg7395368/instances_valminusminival2014.json.zip?dl=0"
-            unZipDir = annDir
-        else:
-            annZipFile = "{}/annotations_trainval{}.zip".format(dataDir, dataYear)
-            annFile = "{}/instances_{}{}.json".format(annDir, dataType, dataYear)
-            annURL = "http://images.cocodataset.org/annotations/annotations_trainval{}.zip".format(dataYear)
-            unZipDir = dataDir
-        # print("Annotations paths:"); print(annDir); print(annFile); print(annZipFile); print(annURL)
-
-        # Download annotations if not available locally
-        if not os.path.exists(annDir):
-            os.makedirs(annDir)
-        if not os.path.exists(annFile):
-            if not os.path.exists(annZipFile):
-                print("Downloading zipped annotations to " + annZipFile + " ...")
-                with urllib.request.urlopen(annURL) as resp, open(annZipFile, 'wb') as out:
-                    shutil.copyfileobj(resp, out)
-                print("... done downloading.")
-            print("Unzipping " + annZipFile)
-            with zipfile.ZipFile(annZipFile, "r") as zip_ref:
-                zip_ref.extractall(unZipDir)
-            print("... done unzipping")
-        print("Will use annotations in " + annFile)
+    @property
+    def skeleton(self):
+        return self._skeleton
+    @property
+    def keypoint_names(self):
+        return self._keypoint_names
 
     def load_mask(self, image_id):
         """Load instance masks for the given image.
@@ -262,12 +232,72 @@ class CocoDataset(utils.Dataset):
 
         # Pack instance masks into an array
         if class_ids:
-            mask = np.stack(instance_masks, axis=2).astype(np.bool)
+            mask = np.stack(instance_masks, axis=2)
             class_ids = np.array(class_ids, dtype=np.int32)
             return mask, class_ids
         else:
             # Call super class to return an empty mask
             return super(CocoDataset, self).load_mask(image_id)
+
+
+    def load_keypoints(self, image_id):
+        """Load person keypoints for the given image.
+
+        Returns:
+        key_points: num_keypoints coordinates and visibility (x,y,v)  [num_person,num_keypoints,3] of num_person
+        masks: A bool array of shape [height, width, instance count] with
+            one mask per instance.
+        class_ids: a 1D array of class IDs of the instance masks, here is always equal to [num_person, 1]
+        """
+        # If not a COCO image, delegate to parent class.
+        image_info = self.image_info[image_id]
+        if image_info["source"] != "coco":
+            return super(CocoDataset, self).load_mask(image_id)
+
+        keypoints = []
+        class_ids = []
+        instance_masks = []
+        annotations = self.image_info[image_id]["annotations"]
+        # Build mask of shape [height, width, instance_count] and list
+        # of class IDs that correspond to each channel of the mask.
+        for annotation in annotations:
+            class_id = self.map_source_class_id(
+                "coco.{}".format(annotation['category_id']))
+            assert class_id == 1
+            if class_id:
+
+                #load masks
+                m = self.annToMask(annotation, image_info["height"],
+                                   image_info["width"])
+                # Some objects are so small that they're less than 1 pixel area
+                # and end up rounded out. Skip those objects.
+                if m.max() < 1:
+                    continue
+                # Is it a crowd? If so, use a negative class ID.
+                if annotation['iscrowd']:
+                    # Use negative class ID for crowds
+                    class_id *= -1
+                    # For crowd masks, annToMask() sometimes returns a mask
+                    # smaller than the given dimensions. If so, resize it.
+                    if m.shape[0] != image_info["height"] or m.shape[1] != image_info["width"]:
+                        m = np.ones([image_info["height"], image_info["width"]], dtype=bool)
+                instance_masks.append(m)
+                #load keypoints
+                keypoint = annotation["keypoints"]
+                keypoint = np.reshape(keypoint,(-1,3))
+
+                keypoints.append(keypoint)
+                class_ids.append(class_id)
+
+        # Pack instance masks into an array
+        if class_ids:
+            keypoints = np.array(keypoints,dtype=np.int32)
+            class_ids = np.array(class_ids, dtype=np.int32)
+            masks = np.stack(instance_masks, axis=2)
+            return keypoints, masks, class_ids
+        else:
+            # Call super class to return an empty mask
+            return super(CocoDataset, self).load_keypoints(image_id)
 
     def image_reference(self, image_id):
         """Return a link to the image in the COCO Website."""
@@ -369,11 +399,9 @@ def evaluate_coco(model, dataset, coco, eval_type="bbox", limit=0, image_ids=Non
         t_prediction += (time.time() - t)
 
         # Convert results to COCO format
-        # Cast masks to uint8 because COCO tools errors out on bool
         image_results = build_coco_results(dataset, coco_image_ids[i:i + 1],
                                            r["rois"], r["class_ids"],
-                                           r["scores"],
-                                           r["masks"].astype(np.uint8))
+                                           r["scores"], r["masks"])
         results.extend(image_results)
 
     # Load results. This modifies results with additional attributes.
@@ -462,7 +490,7 @@ if __name__ == '__main__':
         model_path = COCO_MODEL_PATH
     elif args.model.lower() == "last":
         # Find last trained weights
-        model_path = model.find_last()
+        model_path = model.find_last()[1]
     elif args.model.lower() == "imagenet":
         # Start from ImageNet trained weights
         model_path = model.get_imagenet_weights()
@@ -479,19 +507,13 @@ if __name__ == '__main__':
         # validation set, as as in the Mask RCNN paper.
         dataset_train = CocoDataset()
         dataset_train.load_coco(args.dataset, "train", year=args.year, auto_download=args.download)
-        if args.year in '2014':
-            dataset_train.load_coco(args.dataset, "valminusminival", year=args.year, auto_download=args.download)
+        dataset_train.load_coco(args.dataset, "valminusminival", year=args.year, auto_download=args.download)
         dataset_train.prepare()
 
         # Validation dataset
         dataset_val = CocoDataset()
-        val_type = "val" if args.year in '2017' else "minival"
-        dataset_val.load_coco(args.dataset, val_type, year=args.year, auto_download=args.download)
+        dataset_val.load_coco(args.dataset, "minival", year=args.year, auto_download=args.download)
         dataset_val.prepare()
-
-        # Image Augmentation
-        # Right/Left flip 50% of the time
-        augmentation = imgaug.augmenters.Fliplr(0.5)
 
         # *** This training schedule is an example. Update to your needs ***
 
@@ -500,8 +522,7 @@ if __name__ == '__main__':
         model.train(dataset_train, dataset_val,
                     learning_rate=config.LEARNING_RATE,
                     epochs=40,
-                    layers='heads',
-                    augmentation=augmentation)
+                    layers='heads')
 
         # Training - Stage 2
         # Finetune layers from ResNet stage 4 and up
@@ -509,8 +530,7 @@ if __name__ == '__main__':
         model.train(dataset_train, dataset_val,
                     learning_rate=config.LEARNING_RATE,
                     epochs=120,
-                    layers='4+',
-                    augmentation=augmentation)
+                    layers='4+')
 
         # Training - Stage 3
         # Fine tune all layers
@@ -518,14 +538,12 @@ if __name__ == '__main__':
         model.train(dataset_train, dataset_val,
                     learning_rate=config.LEARNING_RATE / 10,
                     epochs=160,
-                    layers='all',
-                    augmentation=augmentation)
+                    layers='all')
 
     elif args.command == "evaluate":
         # Validation dataset
         dataset_val = CocoDataset()
-        val_type = "val" if args.year in '2017' else "minival"
-        coco = dataset_val.load_coco(args.dataset, val_type, year=args.year, return_coco=True, auto_download=args.download)
+        coco = dataset_val.load_coco(args.dataset, "minival", year=args.year, return_coco=True, auto_download=args.download)
         dataset_val.prepare()
         print("Running COCO evaluation on {} images.".format(args.limit))
         evaluate_coco(model, dataset_val, coco, "bbox", limit=int(args.limit))
