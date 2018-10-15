@@ -13,16 +13,66 @@ import math
 import random
 import numpy as np
 import tensorflow as tf
-import scipy
+import scipy.misc
 import skimage.color
 import skimage.io
-import skimage.transform
 import urllib.request
 import shutil
-import warnings
 
 # URL from which to download the latest COCO trained weights
 COCO_MODEL_URL = "https://github.com/matterport/Mask_RCNN/releases/download/v2.0/mask_rcnn_coco.h5"
+
+
+############################################################
+#  Human Pose
+############################################################
+
+def upsample_filt(size):
+    factor = (size + 1) // 2
+    if size % 2 == 1:
+
+        center = factor - 1
+    else:
+        center = factor - 0.5
+        og = np.ogrid[:size, :size]
+        return (1 - abs(og[0] - center) / factor) * (1 - abs(og[1] - center) / factor)
+
+def bilinear_upsample_weights(factor, number_of_classes):
+    filter_size = factor*2 - factor%2
+    weights = np.zeros((filter_size, filter_size, number_of_classes, number_of_classes),
+                       dtype=np.float32)
+    upsample_kernel = upsample_filt(filter_size)
+    for i in range(number_of_classes):
+        weights[:, :, i, i] = upsample_kernel
+    return weights
+
+def keypoint_to_mask(keypoints,height,width):
+    """Convert keypoints to masks and it's weight.
+       keypoints: [num_person, num_keypoint, 3].
+       height,width: the generated mask shape
+
+       Returns:
+           keypoint_mask: A bool array of shape [height, width, num_person, num_keypoint] with
+            one mask per joint..
+           keypoint_weight: A int array of shape [num_person, num_keypoint] one value per joint
+           0: not visible and without annotations
+           1: not visible but with annotations
+           2: visible and with annotations
+       """
+    shape = np.shape(keypoints)
+
+    keypoint_mask = np.zeros([height,width,shape[0],shape[1]],dtype=bool)
+    keypoint_weight = np.zeros([shape[0],shape[1]],dtype=int)
+    for i in range(shape[0]):
+        for j in range(shape[1]):
+            J = keypoints[i,j]
+            # print(J)
+            if(J[2]):
+                keypoint_mask[J[1],J[0],i,j] = 1
+            keypoint_weight[i, j] = J[2]
+    # keypoint_mask = np.reshape(keypoint_mask,[height,width,-1])
+    # keypoint_weight = np.reshape(keypoint_weight,[-1])
+    return keypoint_mask, keypoint_weight
 
 
 ############################################################
@@ -51,6 +101,10 @@ def extract_bboxes(mask):
             # No mask for this instance. Might happen due to
             # resizing or cropping. Set bbox to zeros
             x1, x2, y1, y2 = 0, 0, 0, 0
+        x1 = 0 if x1<0 else x1
+        y1 = 0 if y1<0 else y1
+        y2 = mask.shape[0] -1 if y2>=mask.shape[0] else y2
+        x2 = mask.shape[1]-1 if x2 >= mask.shape[1] else x2
         boxes[i] = np.array([y1, x1, y2, x2])
     return boxes.astype(np.int32)
 
@@ -63,7 +117,7 @@ def compute_iou(box, boxes, box_area, boxes_area):
     boxes_area: array of length boxes_count.
 
     Note: the areas are passed in rather than calculated here for
-    efficiency. Calculate once in the caller to avoid duplicate work.
+          efficency. Calculate once in the caller to avoid duplicate work.
     """
     # Calculate intersection areas
     y1 = np.maximum(box[0], boxes[:, 0])
@@ -79,6 +133,7 @@ def compute_iou(box, boxes, box_area, boxes_area):
 def compute_overlaps(boxes1, boxes2):
     """Computes IoU overlaps between two sets of boxes.
     boxes1, boxes2: [N, (y1, x1, y2, x2)].
+    :return overlaps [boxes1.shape[0], boxes2.shape[0]]
 
     For better performance, pass the largest set first and the smaller second.
     """
@@ -96,14 +151,10 @@ def compute_overlaps(boxes1, boxes2):
 
 
 def compute_overlaps_masks(masks1, masks2):
-    """Computes IoU overlaps between two sets of masks.
+    '''Computes IoU overlaps between two sets of masks.
     masks1, masks2: [Height, Width, instances]
-    """
-    
-    # If either set of masks is empty return empty result
-    if masks1.shape[0] == 0 or masks2.shape[0] == 0:
-        return np.zeros((masks1.shape[0], masks2.shape[-1]))
-    # flatten masks and compute their areas
+    '''
+    # flatten masks
     masks1 = np.reshape(masks1 > .5, (-1, masks1.shape[-1])).astype(np.float32)
     masks2 = np.reshape(masks2 > .5, (-1, masks2.shape[-1])).astype(np.float32)
     area1 = np.sum(masks1, axis=0)
@@ -118,7 +169,7 @@ def compute_overlaps_masks(masks1, masks2):
 
 
 def non_max_suppression(boxes, scores, threshold):
-    """Performs non-maximum suppression and returns indices of kept boxes.
+    """Performs non-maximum supression and returns indicies of kept boxes.
     boxes: [N, (y1, x1, y2, x2)]. Notice that (y2, x2) lays outside the box.
     scores: 1-D array of box scores.
     threshold: Float. IoU threshold to use for filtering.
@@ -145,10 +196,10 @@ def non_max_suppression(boxes, scores, threshold):
         # Compute IoU of the picked box with the rest
         iou = compute_iou(boxes[i], boxes[ixs[1:]], area[i], area[ixs[1:]])
         # Identify boxes with IoU over the threshold. This
-        # returns indices into ixs[1:], so add 1 to get
-        # indices into ixs.
+        # returns indicies into ixs[1:], so add 1 to get
+        # indicies into ixs.
         remove_ixs = np.where(iou > threshold)[0] + 1
-        # Remove indices of the picked and overlapped boxes.
+        # Remove indicies of the picked and overlapped boxes.
         ixs = np.delete(ixs, remove_ixs)
         ixs = np.delete(ixs, 0)
     return np.array(pick, dtype=np.int32)
@@ -300,6 +351,8 @@ class Dataset(object):
             """Returns a shorter version of object names for cleaner display."""
             return ",".join(name.split(",")[:1])
 
+        # self.class_ids [0-num_id-1]
+        #self.source_class_ids{"coco":[0-num_id-1]}
         # Build (or rebuild) everything else from the info dicts.
         self.num_classes = len(self.class_info)
         self.class_ids = np.arange(self.num_classes)
@@ -307,11 +360,8 @@ class Dataset(object):
         self.num_images = len(self.image_info)
         self._image_ids = np.arange(self.num_images)
 
-        # Mapping from source class and image IDs to internal IDs
         self.class_from_source_map = {"{}.{}".format(info['source'], info['id']): id
                                       for info, id in zip(self.class_info, self.class_ids)}
-        self.image_from_source_map = {"{}.{}".format(info['source'], info['id']): id
-                                      for info, id in zip(self.image_info, self.image_ids)}
 
         # Map sources to class_ids they support
         self.sources = list(set([i['source'] for i in self.class_info]))
@@ -356,7 +406,7 @@ class Dataset(object):
 
     def source_image_link(self, image_id):
         """Returns the path or URL to the image.
-        Override this to return a URL to the image if it's available online for easy
+        Override this to return a URL to the image if it's availble online for easy
         debugging.
         """
         return self.image_info[image_id]["path"]
@@ -369,9 +419,6 @@ class Dataset(object):
         # If grayscale. Convert to RGB for consistency.
         if image.ndim != 3:
             image = skimage.color.gray2rgb(image)
-        # If has an alpha channel, remove it for consistency
-        if image.shape[-1] == 4:
-            image = image[..., :3]
         return image
 
     def load_mask(self, image_id):
@@ -392,29 +439,35 @@ class Dataset(object):
         class_ids = np.empty([0], np.int32)
         return mask, class_ids
 
+    def load_keypoints(self, image_id):
+        """Load keypoints for the given image.
 
-def resize_image(image, min_dim=None, max_dim=None, min_scale=None, mode="square"):
-    """Resizes an image keeping the aspect ratio unchanged.
+        Different datasets use different ways to store masks. Override this
+        method to load keypoints and return them in the form of am
+        array of coordinate(x,y) of shape [num_keypoints, 3].
+
+        Returns:
+            keypoints: A  array of coordinate and visibility [num_keypoints, 3] with
+                (x,y, v) per instance.
+            class_ids: a 1D array of class IDs of the person, always equal to [1].
+        """
+        # Override this function to load a mask from your dataset.
+        # Otherwise, it returns an empty mask.
+        keypoints = np.empty([0, 0])
+        mask = np.empty([0, 0, 0])
+        class_ids = np.empty([0], np.int32)
+        return keypoints, mask, class_ids
+
+
+def resize_image(image, min_dim=None, max_dim=None, padding=False):
+    """
+    Resizes an image keeping the aspect ratio.
 
     min_dim: if provided, resizes the image such that it's smaller
         dimension == min_dim
     max_dim: if provided, ensures that the image longest side doesn't
         exceed this value.
-    min_scale: if provided, ensure that the image is scaled up by at least
-        this percent even if min_dim doesn't require it.
-    mode: Resizing mode.
-        none: No resizing. Return the image unchanged.
-        square: Resize and pad with zeros to get a square image
-            of size [max_dim, max_dim].
-        pad64: Pads width and height with zeros to make them multiples of 64.
-               If min_dim or min_scale are provided, it scales the image up
-               before padding. max_dim is ignored in this mode.
-               The multiple of 64 is needed to ensure smooth scaling of feature
-               maps up and down the 6 levels of the FPN pyramid (2**6=64).
-        crop: Picks random crops from the image. First, scales the image based
-              on min_dim and min_scale, then picks a random crop of
-              size min_dim x min_dim. Can be used in training only.
-              max_dim is not used in this mode.
+    padding: If true, pads image with zeros so it's size is max_dim x max_dim
 
     Returns:
     image: the resized image
@@ -425,39 +478,26 @@ def resize_image(image, min_dim=None, max_dim=None, min_scale=None, mode="square
     scale: The scale factor used to resize the image
     padding: Padding added to the image [(top, bottom), (left, right), (0, 0)]
     """
-    # Keep track of image dtype and return results in the same dtype
-    image_dtype = image.dtype
     # Default window (y1, x1, y2, x2) and default scale == 1.
     h, w = image.shape[:2]
     window = (0, 0, h, w)
     scale = 1
-    padding = [(0, 0), (0, 0), (0, 0)]
-    crop = None
-
-    if mode == "none":
-        return image, window, scale, padding, crop
 
     # Scale?
     if min_dim:
         # Scale up but not down
         scale = max(1, min_dim / min(h, w))
-    if min_scale and scale < min_scale:
-        scale = min_scale
-
     # Does it exceed max dim?
-    if max_dim and mode == "square":
+    if max_dim:
         image_max = max(h, w)
         if round(image_max * scale) > max_dim:
             scale = max_dim / image_max
-
-    # Resize image using bilinear interpolation
+    # Resize image and mask
     if scale != 1:
-        image = skimage.transform.resize(
-            image, (round(h * scale), round(w * scale)),
-            order=1, mode="constant", preserve_range=True)
-
-    # Need padding or cropping?
-    if mode == "square":
+        image = scipy.misc.imresize(
+            image, (round(h * scale), round(w * scale)))
+    # Need padding?
+    if padding:
         # Get new height and width
         h, w = image.shape[:2]
         top_pad = (max_dim - h) // 2
@@ -467,41 +507,10 @@ def resize_image(image, min_dim=None, max_dim=None, min_scale=None, mode="square
         padding = [(top_pad, bottom_pad), (left_pad, right_pad), (0, 0)]
         image = np.pad(image, padding, mode='constant', constant_values=0)
         window = (top_pad, left_pad, h + top_pad, w + left_pad)
-    elif mode == "pad64":
-        h, w = image.shape[:2]
-        # Both sides must be divisible by 64
-        assert min_dim % 64 == 0, "Minimum dimension must be a multiple of 64"
-        # Height
-        if h % 64 > 0:
-            max_h = h - (h % 64) + 64
-            top_pad = (max_h - h) // 2
-            bottom_pad = max_h - h - top_pad
-        else:
-            top_pad = bottom_pad = 0
-        # Width
-        if w % 64 > 0:
-            max_w = w - (w % 64) + 64
-            left_pad = (max_w - w) // 2
-            right_pad = max_w - w - left_pad
-        else:
-            left_pad = right_pad = 0
-        padding = [(top_pad, bottom_pad), (left_pad, right_pad), (0, 0)]
-        image = np.pad(image, padding, mode='constant', constant_values=0)
-        window = (top_pad, left_pad, h + top_pad, w + left_pad)
-    elif mode == "crop":
-        # Pick a random crop
-        h, w = image.shape[:2]
-        y = random.randint(0, (h - min_dim))
-        x = random.randint(0, (w - min_dim))
-        crop = (y, x, min_dim, min_dim)
-        image = image[y:y + min_dim, x:x + min_dim]
-        window = (0, 0, min_dim, min_dim)
-    else:
-        raise Exception("Mode {} not supported".format(mode))
-    return image.astype(image_dtype), window, scale, padding, crop
+    return image, window, scale, padding
 
 
-def resize_mask(mask, scale, padding, crop=None):
+def resize_mask(mask, scale, padding):
     """Resizes a mask using the given scale and padding.
     Typically, you get the scale and padding from resize_image() to
     ensure both, the image and the mask, are resized consistently.
@@ -510,37 +519,202 @@ def resize_mask(mask, scale, padding, crop=None):
     padding: Padding to add to the mask in the form
             [(top, bottom), (left, right), (0, 0)]
     """
-    # Suppress warning from scipy 0.13.0, the output shape of zoom() is
-    # calculated with round() instead of int()
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        mask = scipy.ndimage.zoom(mask, zoom=[scale, scale, 1], order=0)
-    if crop is not None:
-        y, x, h, w = crop
-        mask = mask[y:y + h, x:x + w]
-    else:
-        mask = np.pad(mask, padding, mode='constant', constant_values=0)
+    h, w = mask.shape[:2]
+    mask = scipy.ndimage.zoom(mask, zoom=[scale, scale, 1], order=0)
+    mask = np.pad(mask, padding, mode='constant', constant_values=0)
     return mask
 
 
+def get_keypoints():
+    """Get the COCO keypoints and their left/right flip coorespondence map."""
+    # Keypoints are not available in the COCO json for the test split, so we
+    # provide them here.
+    keypoints = [
+        'nose',
+        'left_eye',
+        'right_eye',
+        'left_ear',
+        'right_ear',
+        'left_shoulder',
+        'right_shoulder',
+        'left_elbow',
+        'right_elbow',
+        'left_wrist',
+        'right_wrist',
+        'left_hip',
+        'right_hip',
+        'left_knee',
+        'right_knee',
+        'left_ankle',
+        'right_ankle'
+    ]
+    keypoint_flip_map = {
+        'left_eye': 'right_eye',
+        'left_ear': 'right_ear',
+        'left_shoulder': 'right_shoulder',
+        'left_elbow': 'right_elbow',
+        'left_wrist': 'right_wrist',
+        'left_hip': 'right_hip',
+        'left_knee': 'right_knee',
+        'left_ankle': 'right_ankle'
+    }
+    return keypoints, keypoint_flip_map
+def flip_keypoints(keypoints, keypoint_flip_map, keypoint_coords, width):
+    """Left/right flip keypoint_coords. keypoints and keypoint_flip_map are
+    accessible from get_keypoints().
+    keypoint_coords:[ni,_person, num_keypoint, 3]
+    width: image_width
+    """
+
+    flipped_kps = keypoint_coords.copy()
+    for lkp, rkp in keypoint_flip_map.items():
+        lid = keypoints.index(lkp)
+        rid = keypoints.index(rkp)
+        flipped_kps[:, lid, :] = keypoint_coords[:, rid, :]
+        flipped_kps[:, rid, :] = keypoint_coords[:, lid, :]
+
+    # Flip x coordinates
+    flipped_kps[:, :, 0] = width - flipped_kps[:, :, 0] - 1
+    # Maintain COCO convention that if visibility == 0, then x, y = 0
+    inds = np.where(flipped_kps[:, :, 2] == 0)
+    flipped_kps[inds[0], inds[1], 0] = 0
+    return flipped_kps
+def resize_keypoints(keypoint, new_size, scale, padding):
+    """Resizes a keypoint  using the given scale and padding.
+        Typically, you get the scale and padding from resize_image() to
+        ensure both, the image and the mask, are resized consistently.
+        keypoint: [num_person, num_keypoint, 3]
+        scale: mask scaling factor
+        padding: Padding to add to the mask in the form
+                [(top, bottom), (left, right), (0, 0)]
+        """
+    keypoint_shape = np.shape(keypoint)
+    num_person = keypoint_shape[0]
+    num_keypoint = keypoint_shape[1]
+    for i in range(num_person):
+        for j in range(num_keypoint):
+            x = keypoint[i,j,0]
+            y = keypoint[i,j,1]
+            vis = keypoint[i,j,2]
+            #scale
+            x = int(x*scale+0.5)
+            y = int(y*scale +0.5)
+            if(x >=new_size[1]):
+                x = new_size[1] -1
+            if(y>= new_size[0]):
+                y = new_size[0] -1
+            #padding
+            x = x + padding[1][0]
+            y = y + padding[0][0]
+            keypoint[i,j,:2] = [x,y]
+
+    # keypoint[:,:,0] = np.array(keypoint[:,:,0]*scale + 0.5).astype(int)
+    # keypoint[:,:,1] = np.array(keypoint[:,:,1]*scale + 0.5).astype(int)
+    # X = keypoint[:,:,0]
+    # Y = keypoint[:,:,1]
+    # X[X>=new_size[1]] = new_size[1] -1
+    # Y[Y>=new_size[0]] = new_size[0] - 1
+    # X = X + padding[1,0]
+    # Y = Y + padding[0,0]
+    # keypoint[:, :, 0] =X
+    # keypoint[:, :, 1] = Y
+
+    return keypoint
+
+
 def minimize_mask(bbox, mask, mini_shape):
-    """Resize masks to a smaller version to reduce memory load.
-    Mini-masks can be resized back to image scale using expand_masks()
+    """Resize masks to a smaller version to cut memory load.
+    Mini-masks can then resized back to image scale using expand_masks()
 
     See inspect_data.ipynb notebook for more details.
     """
     mini_mask = np.zeros(mini_shape + (mask.shape[-1],), dtype=bool)
     for i in range(mask.shape[-1]):
-        # Pick slice and cast to bool in case load_mask() returned wrong dtype
-        m = mask[:, :, i].astype(bool)
+        m = mask[:, :, i]
         y1, x1, y2, x2 = bbox[i][:4]
         m = m[y1:y2, x1:x2]
         if m.size == 0:
             raise Exception("Invalid bounding box with area of zero")
-        # Resize with bilinear interpolation
-        m = skimage.transform.resize(m, mini_shape, order=1, mode="constant")
-        mini_mask[:, :, i] = np.around(m).astype(np.bool)
+        m = scipy.misc.imresize(m.astype(float), mini_shape, interp='bilinear')
+        # _positon = np.argmax(m)  # get the index of max in the a
+        # m_index, n_index = divmod(_positon, mini_shape[0])
+        # print("Max in oringal:", (m_index, n_index), m[m_index, n_index])
+        mini_mask[:, :, i] = np.where(m >= 128, 1, 0)
     return mini_mask
+
+# import cv2
+def minimize_keypoint_mask(bbox, keypointmask, mini_shape):
+    """Resize keypoint_mask to a smaller version to cut memory load.
+        Mini-masks can then resized back to image scale using expand_masks()
+
+        See inspect_data.ipynb notebook for more details.
+        """
+    mini_mask = np.zeros(mini_shape + (keypointmask.shape[2],keypointmask.shape[3],), dtype=bool)
+    for i in range(keypointmask.shape[2]):
+        for j in range(keypointmask.shape[3]):
+            m = keypointmask[:, :, i,j]
+            y1, x1, y2, x2 = bbox[i][:4]
+            m = m[y1:y2, x1:x2]
+            if m.size == 0:
+                raise Exception("Invalid bounding box with area of zero")
+            if m.sum() == 0:
+                mini_mask[0, 0, i,j] = 1
+                # mini_mask = mini_mask
+            else:
+                scale = np.asarray(mini_shape).astype(float) / m.shape
+                cordys, cordxs = np.where(m == np.max(m))
+                scale = np.asarray(mini_shape).astype(float) / m.shape
+                cordys = (cordys * scale[0] + 0.5).astype(int)
+                cordxs = (cordxs * scale[1] + 0.5).astype(int)
+                cordys[cordys >= mini_shape[0]] = mini_shape[0] - 1
+                cordxs[cordxs >= mini_shape[1]] = mini_shape[1] - 1
+                final_y = np.mean(cordys).astype(int)
+                final_x = np.mean(cordxs).astype(int)
+                mini_mask[final_y, final_x, i,j] = 1
+                # scale = np.asarray(mini_shape) / m.shape
+                # cord = np.where(m == int(m.max()))
+                # new_cord = np.array([cord[0] * scale[0], cord[1] * scale[1]], dtype=np.int32).reshape(2, )
+                # mini_mask[new_cord[0], new_cord[1], i,j] = 1
+    return mini_mask
+
+
+
+def expand_keypoint_mask(bbox,mini_mask,image_shape):
+    """Resizes mini keypoint masks back to image size. Reverses the change
+        of minimize_mask().
+
+        See inspect_data.ipynb notebook for more details.
+        """
+    keypoint_mask = np.zeros(image_shape[:2] + (mini_mask.shape[2],mini_mask.shape[3]))
+
+    for i in range(keypoint_mask.shape[2]):
+        for j in range(keypoint_mask.shape[3]):
+            m = mini_mask[:, :, i,j]
+            y1, x1, y2, x2 = bbox[i][:4]
+
+            h = y2 - y1
+            w = x2 - x1
+            result = np.sum(m)
+            if(result):
+                cordys, cordxs = np.where(m == np.max(m))
+                scale = np.asarray([h, w]).astype(float) / m.shape
+                cordys = (cordys * scale[0] + 0.5).astype(int)
+                cordxs = (cordxs * scale[1] + 0.5).astype(int)
+
+                cordys[cordys >= h] = h - 1
+                cordxs[cordxs >= w] = w - 1
+                m = np.zeros(np.asarray([h, w]).astype(int), dtype=bool)
+                # print("m shape:", np.shape(m))
+                final_y = np.mean(cordys).astype(int)
+                final_x = np.mean(cordxs).astype(int)
+                m[final_y, final_x] = 1
+            else:
+                m = np.zeros([h, w])
+
+            keypoint_mask[y1:y2, x1:x2, i,j] = m
+
+
+    return keypoint_mask
 
 
 def expand_mask(bbox, mini_mask, image_shape):
@@ -555,9 +729,12 @@ def expand_mask(bbox, mini_mask, image_shape):
         y1, x1, y2, x2 = bbox[i][:4]
         h = y2 - y1
         w = x2 - x1
-        # Resize with bilinear interpolation
-        m = skimage.transform.resize(m, (h, w), order=1, mode="constant")
-        mask[y1:y2, x1:x2, i] = np.around(m).astype(np.bool)
+        m = scipy.misc.imresize(m.astype(float), (h, w), interp='bilinear')
+        # _positon = np.argmax(m)  # get the index of max in the a
+        # m_index, n_index = divmod(_positon, w)
+        # print("Max in resize:", (m_index, n_index), m[m_index, n_index])
+        mask[y1:y2, x1:x2, i] = np.where(m >= 128, 1, 0)
+
     return mask
 
 
@@ -567,23 +744,63 @@ def mold_mask(mask, config):
 
 
 def unmold_mask(mask, bbox, image_shape):
-    """Converts a mask generated by the neural network to a format similar
-    to its original shape.
-    mask: [height, width] of type float. A small, typically 28x28 mask.
+    """Converts a mask generated by the neural network into a format similar
+    to it's original shape.
+    mask: [height, width, channel] of type float. A small, typically 28x28 mask.
     bbox: [y1, x1, y2, x2]. The box to fit the mask in.
 
     Returns a binary mask with the same size as the original image.
     """
     threshold = 0.5
     y1, x1, y2, x2 = bbox
-    mask = skimage.transform.resize(mask, (y2 - y1, x2 - x1), order=1, mode="constant")
-    mask = np.where(mask >= threshold, 1, 0).astype(np.bool)
+    mask = scipy.misc.imresize(
+        mask, (y2 - y1, x2 - x1), interp='bilinear').astype(np.float32) / 255.0
+    mask = np.where(mask >= threshold, 1, 0).astype(np.uint8)
 
     # Put the mask in the right location.
-    full_mask = np.zeros(image_shape[:2], dtype=np.bool)
+    full_mask = np.zeros(image_shape[:2], dtype=np.uint8)
     full_mask[y1:y2, x1:x2] = mask
     return full_mask
 
+def unmold_keypoint_mask(keypoints_prob, bbox, image_shape, mask, keypoint_mask_shape = (56,56), keypoint_threshold= 0.08):
+    """Converts a mask generated by the neural network into a format similar
+    to it's original shape.
+    keypoints_probe: [num_keypoints, 56*56] of type float.
+    bbox: [y1, x1, y2, x2]. The box to fit the mask in.
+    image_shape:
+    mask: [height, width, channel] of type float. A small, typically 28x28 mask.
+    keypoint_mask_shape:
+    keypoint_threshold: the threshold for filter the low confident keypoint
+    Returns
+    full_mask: [image_shape[0],image_shape[1], num_keypoints]a binary mask with the same size as the original image.
+    keypoints: [num_keypoints, 3] for (x , y, valid)
+    """
+
+    keypoints_label = np.argmax(keypoints_prob,1)
+    keypoint_score = np.max(keypoints_prob,1)
+
+    # print(keypoint_score)
+
+    J_y = keypoints_label // keypoint_mask_shape[1]
+    J_x = keypoints_label % keypoint_mask_shape[1]
+    box_height = float(bbox[2] - bbox[0])
+    box_width = float(bbox[3] - bbox[1])
+    x_scale = box_width / keypoint_mask_shape[1]
+    y_scale = box_height / keypoint_mask_shape[0]
+    x_shift = bbox[1]
+    y_shift = bbox[0]
+    J_x = np.array(x_scale * J_x + 0.5).astype(int) + x_shift
+    J_y = np.array(y_scale * J_y + 0.5).astype(int) + y_shift
+    # print("J_x", J_x)
+    # print("J_y",J_y)
+    J_v = np.array(keypoint_score > keypoint_threshold).astype(int)
+    keypoints = np.stack([J_x,J_y,J_v],axis=1)
+
+    # print("J_v",J_v)
+    full_mask = unmold_mask(mask,bbox,image_shape)
+
+
+    return keypoints, full_mask
 
 ############################################################
 #  Anchors
@@ -662,65 +879,6 @@ def trim_zeros(x):
     return x[~np.all(x == 0, axis=1)]
 
 
-def compute_matches(gt_boxes, gt_class_ids, gt_masks,
-                    pred_boxes, pred_class_ids, pred_scores, pred_masks,
-                    iou_threshold=0.5, score_threshold=0.0):
-    """Finds matches between prediction and ground truth instances.
-
-    Returns:
-        gt_match: 1-D array. For each GT box it has the index of the matched
-                  predicted box.
-        pred_match: 1-D array. For each predicted box, it has the index of
-                    the matched ground truth box.
-        overlaps: [pred_boxes, gt_boxes] IoU overlaps.
-    """
-    # Trim zero padding
-    # TODO: cleaner to do zero unpadding upstream
-    gt_boxes = trim_zeros(gt_boxes)
-    gt_masks = gt_masks[..., :gt_boxes.shape[0]]
-    pred_boxes = trim_zeros(pred_boxes)
-    pred_scores = pred_scores[:pred_boxes.shape[0]]
-    # Sort predictions by score from high to low
-    indices = np.argsort(pred_scores)[::-1]
-    pred_boxes = pred_boxes[indices]
-    pred_class_ids = pred_class_ids[indices]
-    pred_scores = pred_scores[indices]
-    pred_masks = pred_masks[..., indices]
-
-    # Compute IoU overlaps [pred_masks, gt_masks]
-    overlaps = compute_overlaps_masks(pred_masks, gt_masks)
-
-    # Loop through predictions and find matching ground truth boxes
-    match_count = 0
-    pred_match = -1 * np.ones([pred_boxes.shape[0]])
-    gt_match = -1 * np.ones([gt_boxes.shape[0]])
-    for i in range(len(pred_boxes)):
-        # Find best matching ground truth box
-        # 1. Sort matches by score
-        sorted_ixs = np.argsort(overlaps[i])[::-1]
-        # 2. Remove low scores
-        low_score_idx = np.where(overlaps[i, sorted_ixs] < score_threshold)[0]
-        if low_score_idx.size > 0:
-            sorted_ixs = sorted_ixs[:low_score_idx[0]]
-        # 3. Find the match
-        for j in sorted_ixs:
-            # If ground truth box is already matched, go to next one
-            if gt_match[j] > 0:
-                continue
-            # If we reach IoU smaller than the threshold, end the loop
-            iou = overlaps[i, j]
-            if iou < iou_threshold:
-                break
-            # Do we have a match?
-            if pred_class_ids[i] == gt_class_ids[j]:
-                match_count += 1
-                gt_match[j] = i
-                pred_match[i] = j
-                break
-
-    return gt_match, pred_match, overlaps
-
-
 def compute_ap(gt_boxes, gt_class_ids, gt_masks,
                pred_boxes, pred_class_ids, pred_scores, pred_masks,
                iou_threshold=0.5):
@@ -732,15 +890,46 @@ def compute_ap(gt_boxes, gt_class_ids, gt_masks,
     recalls: List of recall values at different class score thresholds.
     overlaps: [pred_boxes, gt_boxes] IoU overlaps.
     """
-    # Get matches and overlaps
-    gt_match, pred_match, overlaps = compute_matches(
-        gt_boxes, gt_class_ids, gt_masks,
-        pred_boxes, pred_class_ids, pred_scores, pred_masks,
-        iou_threshold)
+    # Trim zero padding and sort predictions by score from high to low
+    # TODO: cleaner to do zero unpadding upstream
+    gt_boxes = trim_zeros(gt_boxes)
+    gt_masks = gt_masks[..., :gt_boxes.shape[0]]
+    pred_boxes = trim_zeros(pred_boxes)
+    pred_scores = pred_scores[:pred_boxes.shape[0]]
+    indices = np.argsort(pred_scores)[::-1]
+    pred_boxes = pred_boxes[indices]
+    pred_class_ids = pred_class_ids[indices]
+    pred_scores = pred_scores[indices]
+    pred_masks = pred_masks[..., indices]
+
+    # Compute IoU overlaps [pred_masks, gt_masks]
+    overlaps = compute_overlaps_masks(pred_masks, gt_masks)
+
+    # Loop through ground truth boxes and find matching predictions
+    match_count = 0
+    pred_match = np.zeros([pred_boxes.shape[0]])
+    gt_match = np.zeros([gt_boxes.shape[0]])
+    for i in range(len(pred_boxes)):
+        # Find best matching ground truth box
+        sorted_ixs = np.argsort(overlaps[i])[::-1]
+        for j in sorted_ixs:
+            # If ground truth box is already matched, go to next one
+            if gt_match[j] == 1:
+                continue
+            # If we reach IoU smaller than the threshold, end the loop
+            iou = overlaps[i, j]
+            if iou < iou_threshold:
+                break
+            # Do we have a match?
+            if pred_class_ids[i] == gt_class_ids[j]:
+                match_count += 1
+                gt_match[j] = 1
+                pred_match[i] = 1
+                break
 
     # Compute precision and recall at each prediction box step
-    precisions = np.cumsum(pred_match > -1) / (np.arange(len(pred_match)) + 1)
-    recalls = np.cumsum(pred_match > -1).astype(np.float32) / len(gt_match)
+    precisions = np.cumsum(pred_match) / (np.arange(len(pred_match)) + 1)
+    recalls = np.cumsum(pred_match).astype(np.float32) / len(gt_match)
 
     # Pad with start and end values to simplify the math
     precisions = np.concatenate([[0], precisions, [0]])
@@ -758,30 +947,6 @@ def compute_ap(gt_boxes, gt_class_ids, gt_masks,
                  precisions[indices])
 
     return mAP, precisions, recalls, overlaps
-
-
-def compute_ap_range(gt_box, gt_class_id, gt_mask,
-                     pred_box, pred_class_id, pred_score, pred_mask,
-                     iou_thresholds=None, verbose=1):
-    """Compute AP over a range or IoU thresholds. Default range is 0.5-0.95."""
-    # Default is 0.5 to 0.95 with increments of 0.05
-    iou_thresholds = iou_thresholds or np.arange(0.5, 1.0, 0.05)
-    
-    # Compute AP over range of IoU thresholds
-    AP = []
-    for iou_threshold in iou_thresholds:
-        ap, precisions, recalls, overlaps =\
-            compute_ap(gt_box, gt_class_id, gt_mask,
-                        pred_box, pred_class_id, pred_score, pred_mask,
-                        iou_threshold=iou_threshold)
-        if verbose:
-            print("AP @{:.2f}:\t {:.3f}".format(iou_threshold, ap))
-        AP.append(ap)
-    AP = np.array(AP).mean()
-    if verbose:
-        print("AP @{:.2f}-{:.2f}:\t {:.3f}".format(
-            iou_thresholds[0], iou_thresholds[-1], AP))
-    return AP
 
 
 def compute_recall(pred_boxes, gt_boxes, iou):
@@ -857,37 +1022,3 @@ def download_trained_weights(coco_model_path, verbose=1):
         shutil.copyfileobj(resp, out)
     if verbose > 0:
         print("... done downloading pretrained model!")
-
-
-def norm_boxes(boxes, shape):
-    """Converts boxes from pixel coordinates to normalized coordinates.
-    boxes: [N, (y1, x1, y2, x2)] in pixel coordinates
-    shape: [..., (height, width)] in pixels
-
-    Note: In pixel coordinates (y2, x2) is outside the box. But in normalized
-    coordinates it's inside the box.
-
-    Returns:
-        [N, (y1, x1, y2, x2)] in normalized coordinates
-    """
-    h, w = shape
-    scale = np.array([h - 1, w - 1, h - 1, w - 1])
-    shift = np.array([0, 0, 1, 1])
-    return np.divide((boxes - shift), scale).astype(np.float32)
-
-
-def denorm_boxes(boxes, shape):
-    """Converts boxes from normalized coordinates to pixel coordinates.
-    boxes: [N, (y1, x1, y2, x2)] in normalized coordinates
-    shape: [..., (height, width)] in pixels
-
-    Note: In pixel coordinates (y2, x2) is outside the box. But in normalized
-    coordinates it's inside the box.
-
-    Returns:
-        [N, (y1, x1, y2, x2)] in pixel coordinates
-    """
-    h, w = shape
-    scale = np.array([h - 1, w - 1, h - 1, w - 1])
-    shift = np.array([0, 0, 1, 1])
-    return np.around(np.multiply(boxes, scale) + shift).astype(np.int32)
